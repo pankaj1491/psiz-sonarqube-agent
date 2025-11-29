@@ -1,0 +1,6 @@
+{
+    "LLM_DEFAULT_MODEL": "datarobot/datarobot-deployed-llm",
+    "LLM_DEPLOYMENT_ID": "689cca4777ccb20575aa611f",
+    "LLM_DEFAULT_MODEL_FRIENDLY_NAME": "[DR] openai/gpt-oss-120b",
+    "AGENT_LANGGRAPH_DEPLOYMENT_ID": "692913e4824f0d36870ca48a"
+}

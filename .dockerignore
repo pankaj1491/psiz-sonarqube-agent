@@ -1,0 +1,21 @@
+# .dockerignore
+node_modules
+bar
+
+# Virtual environments
+**venv*
+**.venv*
+**.env*
+
+# Git directories
+**.git**
+**.github**
+
+# Python cache
+**__pycache__
+*.pyc
+*.pyo
+**.mypy_cache
+**.ruff_cache
+**.idea
+
