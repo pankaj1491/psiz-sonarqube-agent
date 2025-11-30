@@ -1,0 +1,79 @@
+{
+  "mcpServers": {
+    "mcp-atlassian": {
+      "disabled": true,
+      "timeout": 60,
+      "type": "stdio",
+      "command": "docker",
+      "args": [
+        "run",
+        "-i",
+        "--rm",
+        "-v",
+        "/etc/ssl/certs/ca-certificates.crt:/etc/ssl/certs/ca-certificates.crt:ro",
+        "-e",
+        "CONFLUENCE_URL",
+        "-e",
+        "CONFLUENCE_PERSONAL_TOKEN",
+        "-e",
+        "JIRA_URL",
+        "-e",
+        "JIRA_PERSONAL_TOKEN",
+        "-e",
+        "JIRA_SSL_VERIFY=false",
+        "-e",
+        "CONFLUENCE_SSL_VERIFY=false",
+        "ghcr.io/sooperset/mcp-atlassian:latest"
+      ],
+      "env": {
+        "CONFLUENCE_URL": "https://confluence.example.com/",
+        "CONFLUENCE_PERSONAL_TOKEN": "<set via env>",
+        "JIRA_URL": "https://jira.example.com/",
+        "JIRA_PERSONAL_TOKEN": "<set via env>"
+      }
+    },
+    "github": {
+      "disabled": false,
+      "timeout": 60,
+      "type": "stdio",
+      "command": "docker",
+      "args": [
+        "run",
+        "-i",
+        "--rm",
+        "-v",
+        "/etc/ssl/certs/ca-certificates.crt:/etc/ssl/certs/ca-certificates.crt:ro",
+        "-e",
+        "GITHUB_PERSONAL_ACCESS_TOKEN",
+        "-e",
+        "GITHUB_HOST=https://eos2git.cec.lab.emc.com",
+        "ghcr.io/github/github-mcp-server"
+      ],
+      "env": {
+        "GITHUB_PERSONAL_ACCESS_TOKEN": "<set via env>"
+      }
+    },
+    "sonarqube": {
+      "disabled": false,
+      "timeout": 60,
+      "type": "stdio",
+      "command": "docker",
+      "args": [
+        "run",
+        "-i",
+        "--rm",
+        "-v",
+        "/etc/ssl/certs/ca-certificates.crt:/etc/ssl/certs/ca-certificates.crt:ro",
+        "-e",
+        "SONAR_HOST_URL",
+        "-e",
+        "SONAR_TOKEN",
+        "ghcr.io/sooperset/mcp-sonarqube:latest"
+      ],
+      "env": {
+        "SONAR_HOST_URL": "https://sonarqube.example.com",
+        "SONAR_TOKEN": "<set via env>"
+      }
+    }
+  }
+}
