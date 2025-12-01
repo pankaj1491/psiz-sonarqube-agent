@@ -1,0 +1,36 @@
+---
+# https://taskfile.dev
+version: '3'
+env:
+  ENV: testing
+dotenv: ['.env', '.env.{.ENV}']
+includes:
+  # Source the agent Taskfile
+  agent:
+    taskfile: ./agent_langgraph/Taskfile.yml
+    dir: ./agent_langgraph
+  # Source the infra Taskfile as flat tasks and point at the infra directory
+  infra:
+    taskfile: ./agent_langgraph/Taskfile_infra.yml
+    dir: ./infra
+tasks:
+  default:
+    desc: "ℹ️ Show all available tasks (run `task --list-all` to see hidden tasks)"
+    cmds:
+      - task --list --sort none
+    silent: true
+  install:
+    desc: "🛠️ Install all dependencies for agent and infra"
+    cmds:
+      - task: agent:install
+      - task: infra:install
+    silent: true
+  build:
+    cmds:
+      - task: infra:build
+  deploy:
+    cmds:
+      - task: infra:deploy
+  destroy:
+    cmds:
+      - task: infra:destroy
