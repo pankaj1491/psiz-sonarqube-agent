@@ -35,6 +35,17 @@ def display_response(response: ChatCompletion, show_output: bool) -> None:
         with open("execute_output.json", "w") as f:
             json.dump(response_dict, f, indent=2)
 
+    # Keep a readable snapshot of the agent's final message even when not showing
+    # the full JSON output, so interactive prompts (e.g., approval requests) are
+    # visible in the terminal.
+    assistant_message = None
+    if isinstance(response_dict.get("choices"), list) and response_dict["choices"]:
+        assistant_message = (
+            response_dict["choices"][0]
+            .get("message", {})
+            .get("content")
+        )
+
     if "pipeline_interactions" in response_dict:
         response_dict["pipeline_interactions"] = "[Truncated for display]"
 
@@ -42,12 +53,17 @@ def display_response(response: ChatCompletion, show_output: bool) -> None:
         click.echo("\nExecution result:")
         click.echo(json.dumps(response_dict, indent=2))
     else:
-        if "choices" in response_dict:
-            response_dict["choices"] = "[Truncated for display]"
+        preview_payload = {
+            "id": response_dict.get("id"),
+            "created": response_dict.get("created"),
+            "model": response_dict.get("model"),
+            "assistant_message": assistant_message,
+            "pipeline_interactions": response_dict.get("pipeline_interactions"),
+            "usage": response_dict.get("usage"),
+        }
 
-        # Show only first 200 characters of response
         click.echo("\nExecution result preview:")
-        click.echo(json.dumps(response_dict, indent=2))
+        click.echo(json.dumps(preview_payload, indent=2))
         click.echo("")
         click.echo("IMPORTANT")
         click.echo(
@@ -112,12 +128,19 @@ def cli(
 @click.option(
     "--show_output", is_flag=True, help="Show the full stored execution result."
 )
+@click.option(
+    "--auto_approve",
+    is_flag=True,
+    default=False,
+    help="Auto-approve MCP tool calls (useful for non-interactive CLI runs).",
+)
 def execute(
     environment: Any,
     user_prompt: str,
     completion_json: str,
     show_output: bool,
     stream: bool,
+    auto_approve: bool,
 ) -> None:
     """Execute agent code locally using OpenAI completions.
 
@@ -146,7 +169,7 @@ def execute(
         user_prompt=user_prompt,
         completion_json=completion_json,
         stream=stream,
-        config=Config(),
+        config=Config(auto_approve_tools=auto_approve),
     )
     if stream:
         display_response_streaming(response)
