@@ -19,10 +19,15 @@ The example configuration now includes GitHub and SonarQube servers; copy it to 
 load both servers at startup. The orchestrator detects tool capabilities (SonarQube, repo editing, commit,
 and PR helpers) and surfaces them to the LLM as system context.
 
+For SonarQube issue enumeration, the orchestrator relies on the `search_sonar_issues_in_projects` MCP tool
+provided by the SonarQube server. You should see that tool listed in the startup log under "SonarQube tools"
+once the server is enabled and loaded.
+
 The default workflow is streamlined for SonarQube automation while keeping an LLM in the loop:
-`START → entry_node → checkout_node → sonarqube_orchestrator → END`.
-After cloning the repository through the GitHub MCP tool, the SonarQube orchestrator uses an LLM configured
-with MCP tools to plan and execute SonarQube remediation. The orchestrator’s system prompt instructs the LLM
-to ask the user for approval **before every MCP tool call**, to use SonarQube tools to fetch and verify code
-smells, to apply fixes with repository-editing tools, and to commit and open pull requests via GitHub MCP
-tools on the suggested working branch.
+`START → entry_node → checkout_node → sonarqube_autorun → sonarqube_orchestrator → END`.
+After cloning the repository through the GitHub MCP tool, the `sonarqube_autorun` node immediately calls
+`search_my_sonarqube_projects` and then `search_sonar_issues_in_projects` (when auto-approval is enabled) to
+seed the graph state with discovered project keys and issue lists. The subsequent SonarQube orchestrator uses
+the LLM plus MCP tools to apply fixes, commit, and open pull requests via GitHub MCP helpers on the suggested
+working branch. Tool calls are auto-approved by default to ensure non-interactive runs do not stall; the agent
+still announces and summarizes each call. Use `--require_approval` if you want to force manual approvals instead.
