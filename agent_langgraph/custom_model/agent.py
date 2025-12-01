@@ -51,11 +51,17 @@ class MyAgent(LangGraphAgent):
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         print("Initializing MCP client...")
-        self._mcp_client = build_mcp_client("/home/kumarp94/agents/psiz-sonarqube-agent/agent_langgraph/custom_model/mcp_servers.json")
-        print(f"MCP client initialized: {self._mcp_client}")
+        mcp_config_path = os.environ.get("MCP_SERVERS_CONFIG_PATH")
+        self._mcp_client = build_mcp_client(mcp_config_path)
+        connection_names = ", ".join(sorted(self._mcp_client.connections.keys()))
+        print(f"MCP client initialized with servers: {connection_names}")
         self._mcp_tools = self._load_mcp_tools()
         print(f"Loaded MCP tools: {len(self._mcp_tools)}")
         self._tool_capabilities = self._categorize_tools(self._mcp_tools)
+        if not self._tool_capabilities.get("sonarqube"):
+            print(
+                "Warning: no SonarQube tools detected. Check that the 'sonarqube' MCP server is enabled in the config."
+            )
 
     @property
     def mcp_client(self):  # type: ignore[override]
@@ -384,25 +390,42 @@ class MyAgent(LangGraphAgent):
 
     @property
     def prompt_template(self) -> ChatPromptTemplate:
+        approval_line = (
+            "Auto-approval is enabled for tool calls; proceed without waiting for yes/no but still summarize after each run."
+            if self.config.auto_approve_tools
+            else "Always ask for approval before running tools."
+        )
+
         return ChatPromptTemplate.from_messages(
             [
                 (
                     "user",
-                    f"The topic is {{topic}}. Make sure Only after fixes, create a PR. Always ask for approval before running tools.Keep the user informed after each tool run with concise summaries."
+                    f"The topic is {{topic}}. Make sure Only after fixes, create a PR. {approval_line}Keep the user informed after each tool run with concise summaries."
                 ),
             ]
         )
 
     @property
     def _sonarqube_system_prompt(self) -> str:
+        if self.config.auto_approve_tools:
+            approval_guidance = (
+                "Auto-approval is enabled for this run. You may invoke MCP tools without pausing for explicit user confirmation, "
+                "but you must clearly announce each tool call (name, purpose, key inputs) before executing and summarize outcomes after. "
+                "Do not ask 'Approve?' or wait for user responses; proceed autonomously."
+            )
+        else:
+            approval_guidance = (
+                "Always ask the user for explicit approval before invoking any MCP tool. "
+                "When you plan to call a tool, first summarize the exact command, inputs, and effect, "
+                "ask 'Approve? (yes/no)' and wait for the user to respond with 'yes' before executing. "
+                "Do not auto-approve or guess approvals."
+            )
+
         return (
             "You are an AI release engineer fixing SonarQube issues via MCP tools. "
-            "Always ask the user for explicit approval before invoking any MCP tool. "
-            "When you plan to call a tool, first summarize the exact command, inputs, and effect, "
-            "ask 'Approve? (yes/no)' and wait for the user to respond with 'yes' before executing. "
-            "Do not auto-approve or guess approvals."
-            "\n"
-            "Workflow guidance:\n"
+            + approval_guidance
+            + "\n"
+            + "Workflow guidance:\n"
             "1) Use the repo path from shared state to run SonarQube scans and apply fixes.\n"
             "2) Prefer the GitHub MCP clone tool output path and derived working branch for changes.\n"
             "3) Use SonarQube MCP tools (see available tool names in the latest system message) to fetch code smells, suggest remediation, and re-check after changes.\n"
@@ -414,6 +437,9 @@ class MyAgent(LangGraphAgent):
 
     def _tools_with_approval_instructions(self) -> list[BaseTool]:
         """Return MCP tools with names/descriptions annotated for approval etiquette."""
+
+        if self.config.auto_approve_tools:
+            return self.mcp_tools
 
         annotated_tools: list[BaseTool] = []
         for tool in self.mcp_tools:
