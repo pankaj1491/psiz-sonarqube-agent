@@ -129,10 +129,12 @@ def cli(
     "--show_output", is_flag=True, help="Show the full stored execution result."
 )
 @click.option(
-    "--auto_approve",
-    is_flag=True,
-    default=False,
-    help="Auto-approve MCP tool calls (useful for non-interactive CLI runs).",
+    "--auto_approve/--require_approval",
+    default=True,
+    help=(
+        "Auto-approve MCP tool calls (default). Use --require_approval to force"
+        " manual confirmation."
+    ),
 )
 def execute(
     environment: Any,

@@ -37,7 +37,7 @@ class Config(DataRobotAppFrameworkBaseSettings):
     use_datarobot_llm_gateway: bool = False
     mcp_deployment_id: str | None = None
     external_mcp_url: str | None = None
-    auto_approve_tools: bool = False
+    auto_approve_tools: bool = True
 
     agent_endpoint: str = Field(
         default="http://localhost:8842", validation_alias="AGENT_LANGGRAPH_ENDPOINT"

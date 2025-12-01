@@ -17,6 +17,7 @@ from datetime import datetime
 from functools import partial
 from pathlib import Path
 from typing import Any, TypedDict, cast
+from urllib.parse import urlparse
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.prompts import ChatPromptTemplate
@@ -81,10 +82,12 @@ class MyAgent(LangGraphAgent):
         ](AgentState)
         langgraph_workflow.add_node("entry_node", self.entry_node)
         langgraph_workflow.add_node("checkout_node", self.checkout_node)
+        langgraph_workflow.add_node("sonarqube_autorun", self.sonarqube_autorun)
         langgraph_workflow.add_node("sonarqube_orchestrator", self.agent_sonarqube_orchestrator)
         langgraph_workflow.add_edge(START, "entry_node")
         langgraph_workflow.add_edge("entry_node", "checkout_node")
-        langgraph_workflow.add_edge("checkout_node", "sonarqube_orchestrator")
+        langgraph_workflow.add_edge("checkout_node", "sonarqube_autorun")
+        langgraph_workflow.add_edge("sonarqube_autorun", "sonarqube_orchestrator")
         langgraph_workflow.add_edge("sonarqube_orchestrator", END)
         return langgraph_workflow  # type: ignore[return-value]
 
@@ -145,6 +148,109 @@ class MyAgent(LangGraphAgent):
                 "working_branch": working_branch,
                 "messages": messages,
                 "available_tools": tool_hint,
+            }
+        )
+
+    def _find_tool(self, name: str) -> BaseTool | None:
+        return next((tool for tool in self._mcp_tools if tool.name == name), None)
+
+    def _repo_hint(self, state: AgentState) -> str | None:
+        """Derive a repo identifier for matching SonarQube project keys."""
+
+        if state.get("repo_path"):
+            return Path(cast(str, state["repo_path"])).name.lower()
+
+        if state.get("repository_url"):
+            parsed = urlparse(cast(str, state["repository_url"]))
+            if parsed.path:
+                return Path(parsed.path).stem.lower()
+        return None
+
+    def _match_project_key(self, projects: Any, hint: str | None) -> str | None:
+        """Best-effort match of SonarQube project key using repo hint."""
+
+        if hint is None:
+            return None
+
+        candidates: list[Any] = []
+        if isinstance(projects, list):
+            candidates = projects
+        if isinstance(projects, dict):
+            for key in ["projects", "components", "results", "items"]:
+                if isinstance(projects.get(key), list):
+                    candidates = projects[key]
+                    break
+
+        hint = hint.lower()
+        for item in candidates:
+            if not isinstance(item, dict):
+                continue
+            key = item.get("key") or item.get("projectKey") or item.get("id")
+            name = item.get("name") or item.get("project")
+            if key and hint in str(key).lower():
+                return str(key)
+            if name and hint in str(name).lower():
+                return str(key or name)
+        return None
+
+    def sonarqube_autorun(self, state: AgentState) -> Command[Any]:
+        """Eagerly fetch SonarQube issues when auto-approval is enabled."""
+
+        messages = list(state.get("messages", []))
+
+        if not self.config.auto_approve_tools:
+            return Command(update={"messages": messages})
+
+        projects_tool = self._find_tool("search_my_sonarqube_projects")
+        issues_tool = self._find_tool("search_sonar_issues_in_projects")
+
+        if not projects_tool or not issues_tool:
+            messages.append(
+                SystemMessage(
+                    content=(
+                        "Auto-approval is on, but SonarQube discovery tools are missing. "
+                        "The orchestrator will continue without the eager fetch step."
+                    )
+                )
+            )
+            return Command(update={"messages": messages})
+
+        projects_result = projects_tool.invoke({})
+        messages.append(
+            SystemMessage(
+                content=(
+                    "Auto SonarQube discovery: called search_my_sonarqube_projects and received "
+                    f"{projects_result}."
+                )
+            )
+        )
+
+        project_key = self._match_project_key(projects_result, self._repo_hint(state))
+        if not project_key:
+            messages.append(
+                SystemMessage(
+                    content=(
+                        "Could not auto-match a SonarQube project key from the discovery output. "
+                        "Proceeding to orchestrator to decide next steps."
+                    )
+                )
+            )
+            return Command(update={"messages": messages})
+
+        issues_result = issues_tool.invoke({"projects": project_key})
+        messages.append(
+            SystemMessage(
+                content=(
+                    f"Auto SonarQube issues fetch for project '{project_key}': {issues_result}."
+                )
+            )
+        )
+
+        return Command(
+            update={
+                "messages": messages,
+                "sonarqube_project_key": project_key,
+                "sonarqube_result": issues_result,
             }
         )
 
@@ -429,11 +535,13 @@ class MyAgent(LangGraphAgent):
             + approval_guidance
             + "\n"
             + "Workflow guidance:\n"
-            "1) Use the repo path from shared state to run SonarQube scans and apply fixes.\n"
+            "1) Immediately fetch SonarQube issues for the cloned repo: if the project key is unknown, call"
+            " search_my_sonarqube_projects to find a key matching the repository name or the repo_path; then call"
+            " search_sonar_issues_in_projects with that key and summarize results before applying fixes.\n"
             "2) Prefer the GitHub MCP clone tool output path and derived working branch for changes.\n"
             "3) Use SonarQube MCP tools (see available tool names in the latest system message) to fetch code smells, suggest remediation, and re-check after changes.\n"
-            "4) Use repository-editing tools (write/apply/patch) to apply fixes only after user approval.\n"
-            "5) After fixes, use GitHub MCP tools to commit changes on the suggested working branch and open a pull request when approved.\n"
+            "4) When auto-approval is enabled, apply repository changes directly after announcing the intent; otherwise ask for user approval.\n"
+            "5) After fixes, use GitHub MCP tools to commit changes on the suggested working branch and open a pull request.\n"
             "6) Keep the user informed after each tool run with concise summaries, including what changed and any remaining issues.\n"
             "7) Keep conversations focused on SonarQube remediation and PR creation."
         )
