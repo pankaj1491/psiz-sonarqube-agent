@@ -28,22 +28,38 @@ DEFAULT_CONFIG_FILENAME = "mcp_servers.json"
 
 
 def _ensure_path(config_path: str | None) -> Path:
-    """Resolve the MCP config path, preferring env override when provided."""
+    """Resolve the MCP config path, preferring env override when provided.
 
-    resolved_path = Path(
-        config_path
-        or os.environ.get("MCP_SERVERS_CONFIG_PATH")
-        or Path(__file__).with_name(DEFAULT_CONFIG_FILENAME)
+    If the provided path is relative, check it relative to the current working
+    directory *and* next to this module so users can pass `agent_langgraph/...`
+    even when the runtime cwd differs.
+    """
+
+    raw_path = config_path or os.environ.get("MCP_SERVERS_CONFIG_PATH")
+    candidates: list[Path] = []
+
+    if raw_path:
+        explicit = Path(raw_path).expanduser()
+        candidates.append(explicit)
+
+        if not explicit.is_absolute():
+            module_dir = Path(__file__).resolve().parent
+            candidates.append(module_dir / explicit)
+            candidates.append(Path.cwd() / explicit)
+    else:
+        candidates.append(Path(__file__).with_name(DEFAULT_CONFIG_FILENAME))
+
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+
+    searched = ", ".join(str(path) for path in candidates)
+    raise FileNotFoundError(
+        "MCP server config not found. Searched: "
+        f"{searched or 'no candidates'}. "
+        "Provide MCP_SERVERS_CONFIG_PATH or create mcp_servers.json next to "
+        "mcp_client.py (use mcp_servers.json.example as a starting point)."
     )
-
-    if not resolved_path.exists():
-        raise FileNotFoundError(
-            f"MCP server config not found at {resolved_path}. "
-            "Provide MCP_SERVERS_CONFIG_PATH or create mcp_servers.json next to mcp_client.py "
-            "(use mcp_servers.json.example as a starting point)."
-        )
-
-    return resolved_path
 
 
 def _normalize_env(env: dict[str, Any] | None) -> dict[str, str] | None:
