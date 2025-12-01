@@ -151,7 +151,15 @@ def chat(
 
     # Instantiate the agent, all fields from the completion_create_params are passed to the agent
     # allowing environment variables to be passed during execution
-    agent = MyAgent(**completion_create_params)
+    agent_kwargs = dict(completion_create_params)
+    # Instantiate the agent, all fields from the completion_create_params are passed to the agent
+    # allowing environment variables to be passed during execution
+    agent_kwargs = dict(completion_create_params)
+    # Pass config to the agent if it's available in kwargs
+    config = kwargs.get("config")
+    if config:
+        agent_kwargs["config"] = config
+    agent = MyAgent(**agent_kwargs)
 
     # Invoke the agent and check if it returns a generator or a tuple
     # Set the authorization context in the worker thread before invoking the agent
