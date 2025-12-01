@@ -50,6 +50,9 @@ class MyAgent(LangGraphAgent):
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
+        # Handle configuration passed from CLI
+        if "config" in kwargs:
+            self.config = kwargs["config"]
         print("Initializing MCP client...")
         mcp_config_path = os.environ.get("MCP_SERVERS_CONFIG_PATH")
         self._mcp_client = build_mcp_client(mcp_config_path)
