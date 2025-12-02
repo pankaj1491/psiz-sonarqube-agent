@@ -16,6 +16,7 @@ tasks:
     cmds:
       - echo "Updating local dependencies for agent_langgraph"
       - uv sync --extra dev
+      - task: install-poolside
       - if [ -f pyproject.toml ] && [ -d docker_context ]; then cp pyproject.toml docker_context/pyproject.toml; fi
       - if [ -f uv.lock ] && [ -d docker_context ]; then cp uv.lock docker_context/uv.lock; fi
     aliases:
@@ -74,6 +75,7 @@ tasks:
     vars:
       START_DEV: "{{.START_DEV}}"
     cmds:
+      - task: install-poolside
       - echo "Running CLI {{.CLI_ARGS}}"
       - |
         if [ "{{.START_DEV}}" -eq "1" ]; then
@@ -148,6 +150,37 @@ tasks:
       - echo "🛝 Starting ChainLit playground"
       - uv sync --all-extras
       - uv run chainlit run --host 0.0.0.0 --port 8083 -w lit.py
+
+  install-poolside:
+    desc: "🛠️ [agent_langgraph] Install Pool CLI from repo tarball and seed credentials"
+    cmds:
+      - |
+        set -euo pipefail
+        REPO_ROOT="$(cd "{{.TASKFILE_DIR}}/.." && pwd)"
+        ARCHIVE_PATH="${POOLSIDE_TARBALL:-$REPO_ROOT/pool-v0.2.105-linux-amd64.tar.gz}"
+        if command -v pool >/dev/null 2>&1; then
+          echo "✔ Pool CLI already installed at $(command -v pool)"
+        else
+          echo "🔧 Installing Pool CLI..."
+          tar -xzf "$ARCHIVE_PATH" -C "$REPO_ROOT"
+          sudo mv "$REPO_ROOT/pool-linux-amd64" /usr/local/bin/
+          sudo mv /usr/local/bin/pool-linux-amd64 /usr/local/bin/pool
+          sudo chmod +x /usr/local/bin/pool
+          echo "✔ Binary installed."
+        fi
+
+        mkdir -p ~/.config/poolside
+        printf '[{"type":"api-key","apiUrl":"http://poolside.rr2caitest01.amer.dell.com","token":"ps-bAuFkHEj9nG4Jwtwp8s3RvR9tP0S2KumDuSlX3L6TRDFBNq-31LcsgaeWX1oN3UhUlh1Z"}]' > ~/.config/poolside/credentials.json
+        printf 'pool:\n  api_url: http://poolside.rr2caitest01.amer.dell.com\n' > ~/.config/poolside/settings.yaml
+        chmod 600 ~/.config/poolside/credentials.json
+
+        echo "🔍 Verifying installation..."
+        if pool --version >/dev/null 2>&1; then
+          echo "✔ Pool CLI is functional, running test prompt..."
+          pool -p "hello from this machine"
+        else
+          echo "❌ Pool binary exists but failed to run."
+        fi
   create-docker-context:
     desc: 🐳 [agent_langgraph] Create the template for a local docker_context image
     cmds:
