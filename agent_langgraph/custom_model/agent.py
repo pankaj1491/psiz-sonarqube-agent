@@ -11,7 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import json
 import os
+import shutil
 import subprocess
 from datetime import datetime
 from functools import partial
@@ -26,6 +28,7 @@ from langchain_litellm.chat_models import ChatLiteLLM
 from langgraph.graph import END, START, StateGraph
 from langgraph.prebuilt import create_react_agent
 from langgraph.types import Command
+from pydantic import BaseModel, Field
 
 from config import Config
 from datarobot_genai.core.agents import make_system_prompt
@@ -34,11 +37,67 @@ from datarobot_genai.langgraph.agent import LangGraphAgent
 from mcp_client import build_mcp_client, load_mcp_tools
 
 
+class PoolsideCLIArgs(BaseModel):
+    """Inputs for invoking the Poolside CLI helper."""
+
+    args: list[str] = Field(
+        ..., description="Arguments passed to the poolside CLI (excluding the binary itself)."
+    )
+    working_dir: str | None = Field(
+        None, description="Optional working directory; defaults to the repo path or current directory."
+    )
+
+
+class PoolsideCLITool(BaseTool):
+    """Lightweight wrapper for a locally installed Poolside CLI."""
+
+    name = "poolside_cli"
+    description = (
+        "Run the Poolside CLI for repo-aware code edits. Provide the exact argument list you would "
+        "pass to the `poolside` binary; working_dir should be the repository root when applying patches."
+    )
+    args_schema = PoolsideCLIArgs
+
+    def __init__(self, command: str, default_cwd: str | None, env_overrides: dict[str, str]) -> None:
+        super().__init__()
+        self._command = command
+        self._default_cwd = default_cwd
+        self._env_overrides = env_overrides
+
+    def retarget_working_dir(self, cwd: str) -> None:
+        """Update the default working directory after checkout."""
+
+        self._default_cwd = cwd
+
+    def _run(
+        self, args: list[str], working_dir: str | None = None, **_: Any
+    ) -> dict[str, Any]:
+        cwd = working_dir or self._default_cwd or os.getcwd()
+        env = os.environ.copy()
+        env.update(self._env_overrides)
+        result = subprocess.run(
+            [self._command, *args],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        return {
+            "exit_code": result.returncode,
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+            "cwd": cwd,
+            "command": [self._command, *args],
+            "env_keys": sorted(self._env_overrides.keys()),
+        }
+
+
 class AgentState(TypedDict, total=False):
     messages: list[Any]
     repo_path: str | None
     repository_url: str | None
     working_branch: str | None
+    pr_created: bool | None
     sonarqube_project_key: str | None
     sonarqube_result: Any
     available_tools: dict[str, list[str]]
@@ -108,6 +167,9 @@ class MyAgent(LangGraphAgent):
         repo_path = self._clone_repository(repository_url)
         working_branch = self._derive_working_branch(state, repo_path)
 
+        self._retarget_poolside_tool(repo_path)
+        self._index_repo_with_poolside(repo_path)
+
         messages = list(state.get("messages", []))
         tool_hint = self._tool_capabilities
         tool_summary_lines = []
@@ -126,6 +188,10 @@ class MyAgent(LangGraphAgent):
         if tool_hint["git_pr"]:
             tool_summary_lines.append(
                 "PR tools: " + ", ".join(sorted(tool_hint["git_pr"]))
+            )
+        if tool_hint["inline_edit"]:
+            tool_summary_lines.append(
+                "Inline editing tools: " + ", ".join(sorted(tool_hint["inline_edit"]))
             )
 
         tool_summary = "; ".join(tool_summary_lines) if tool_summary_lines else "No tool hints"
@@ -166,6 +232,19 @@ class MyAgent(LangGraphAgent):
                 return Path(parsed.path).stem.lower()
         return None
 
+    def _repo_name_for_sonar(self, state: AgentState) -> str | None:
+        """Return the repository name used to derive the SonarQube project key."""
+
+        if state.get("repo_path"):
+            return Path(cast(str, state["repo_path"])).name
+
+        if state.get("repository_url"):
+            parsed = urlparse(cast(str, state["repository_url"]))
+            if parsed.path:
+                return Path(parsed.path).stem
+
+        return None
+
     def _match_project_key(self, projects: Any, hint: str | None) -> str | None:
         """Best-effort match of SonarQube project key using repo hint."""
 
@@ -201,56 +280,93 @@ class MyAgent(LangGraphAgent):
         if not self.config.auto_approve_tools:
             return Command(update={"messages": messages})
 
-        projects_tool = self._find_tool("search_my_sonarqube_projects")
         issues_tool = self._find_tool("search_sonar_issues_in_projects")
 
-        if not projects_tool or not issues_tool:
+        if not issues_tool:
             messages.append(
                 SystemMessage(
                     content=(
-                        "Auto-approval is on, but SonarQube discovery tools are missing. "
+                        "Auto-approval is on, but the SonarQube issue tool is missing. "
                         "The orchestrator will continue without the eager fetch step."
                     )
                 )
             )
             return Command(update={"messages": messages})
 
-        projects_result = projects_tool.invoke({})
-        messages.append(
-            SystemMessage(
-                content=(
-                    "Auto SonarQube discovery: called search_my_sonarqube_projects and received "
-                    f"{projects_result}."
-                )
-            )
-        )
-
-        project_key = self._match_project_key(projects_result, self._repo_hint(state))
-        if not project_key:
+        repo_name = self._repo_name_for_sonar(state)
+        if not repo_name:
             messages.append(
                 SystemMessage(
                     content=(
-                        "Could not auto-match a SonarQube project key from the discovery output. "
-                        "Proceeding to orchestrator to decide next steps."
+                        "Could not derive repository name to compute the SonarQube project key. "
+                        "Proceeding without autorun issue fetch."
                     )
                 )
             )
             return Command(update={"messages": messages})
 
+        project_key = f"CloudIQ:{repo_name}"
         issues_result = issues_tool.invoke({"projects": project_key})
         messages.append(
             SystemMessage(
                 content=(
-                    f"Auto SonarQube issues fetch for project '{project_key}': {issues_result}."
+                    "Auto SonarQube issues fetch using computed project key "
+                    f"'{project_key}': {issues_result}."
                 )
             )
         )
+
+        repo_path = cast(str | None, state.get("repo_path"))
+        working_branch = cast(str | None, state.get("working_branch"))
+        repository_url = cast(str | None, state.get("repository_url"))
+        issues = self._extract_sonar_issues(issues_result)
+
+        pr_created = False
+
+        if repo_path and working_branch and issues:
+            poolside_applied = self._apply_sonar_issues_with_poolside(
+                repo_path=repo_path, issues=issues
+            )
+            if poolside_applied:
+                messages.append(
+                    SystemMessage(
+                        content=(
+                            "Applied SonarQube issues via poolside_cli "
+                            f"for {len(poolside_applied)} issue(s): {poolside_applied}."
+                        )
+                    )
+                )
+
+                commit_status = self._git_commit_push_pr(
+                    repo_path=repo_path,
+                    branch=working_branch,
+                    repository_url=repository_url,
+                    issue_count=len(poolside_applied),
+                )
+                pr_created = bool(commit_status.get("pull_request"))
+                messages.append(
+                    SystemMessage(
+                        content=(
+                            "Git/PR automation summary after Poolside fixes: "
+                            f"{json.dumps(commit_status)}"
+                        )
+                    )
+                )
+                messages.append(
+                    SystemMessage(
+                        content=(
+                            "PR policy: only one PR per end-to-end run. "
+                            "A PR has already been attempted; do not open another."
+                        )
+                    )
+                )
 
         return Command(
             update={
                 "messages": messages,
                 "sonarqube_project_key": project_key,
                 "sonarqube_result": issues_result,
+                "pr_created": pr_created,
             }
         )
 
@@ -385,6 +501,206 @@ class MyAgent(LangGraphAgent):
         repo_name = repository_url.rstrip("/").split("/")[-1]
         return repo_name.removesuffix(".git")
 
+    def _retarget_poolside_tool(self, repo_path: str) -> None:
+        tool = next((t for t in self._mcp_tools if isinstance(t, PoolsideCLITool)), None)
+        if not tool:
+            return
+
+        tool.retarget_working_dir(repo_path)
+        os.environ.setdefault("POOLSIDE_CWD", repo_path)
+        print(f"Poolside CLI working directory set to {repo_path}")
+
+    def _index_repo_with_poolside(self, repo_path: str) -> None:
+        if not self.config.auto_approve_tools:
+            return
+
+        tool = next((t for t in self._mcp_tools if isinstance(t, PoolsideCLITool)), None)
+        if not tool:
+            return
+
+        args = [
+            "--unsafe-auto-allow",
+            "-p",
+            "Index this repository for context before applying SonarQube fixes",
+            "--",
+            ".",
+        ]
+        result = tool.invoke({"args": args, "working_dir": repo_path})
+        print(
+            "Poolside indexing run",
+            json.dumps(
+                {
+                    "command": result.get("command"),
+                    "exit_code": result.get("exit_code"),
+                    "cwd": result.get("cwd"),
+                },
+                indent=2,
+            ),
+        )
+
+    def _extract_sonar_issues(self, issues_result: Any) -> list[dict[str, Any]]:
+        """Normalize SonarQube issue payloads from various response shapes."""
+
+        if isinstance(issues_result, dict):
+            for key in ["issues", "results", "items", "components"]:
+                maybe = issues_result.get(key)
+                if isinstance(maybe, list):
+                    return [i for i in maybe if isinstance(i, dict)]
+        if isinstance(issues_result, list):
+            return [i for i in issues_result if isinstance(i, dict)]
+        return []
+
+    def _apply_sonar_issues_with_poolside(
+        self, repo_path: str, issues: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """Apply SonarQube issues using the Poolside CLI helper when available."""
+
+        if not self.config.auto_approve_tools:
+            return []
+
+        tool = next((t for t in self._mcp_tools if isinstance(t, PoolsideCLITool)), None)
+        if not tool:
+            return []
+
+        applied: list[dict[str, Any]] = []
+        for issue in issues:
+            component = issue.get("component", "")
+            relative_path = component.split(":", 1)[1] if ":" in component else component
+            text_range = issue.get("textRange") or {}
+            start_line = text_range.get("startLine")
+            end_line = text_range.get("endLine")
+            line_hint = (
+                f" (lines {start_line}-{end_line})" if start_line or end_line else ""
+            )
+            prompt = (
+                "Apply a patch to resolve this SonarQube issue: "
+                f"{issue.get('rule')} - {issue.get('message')} at {relative_path}{line_hint}. "
+                "Use the repository context to fix the violation and ensure the file remains valid."
+            )
+            args = ["--unsafe-auto-allow", "-p", prompt, "--", relative_path]
+            result = tool.invoke({"args": args, "working_dir": repo_path})
+            applied.append(
+                {
+                    "issue_key": issue.get("key"),
+                    "file": relative_path,
+                    "exit_code": result.get("exit_code"),
+                    "stdout": result.get("stdout"),
+                    "stderr": result.get("stderr"),
+                }
+            )
+
+        return applied
+
+    def _git_commit_push_pr(
+        self,
+        repo_path: str,
+        branch: str,
+        repository_url: str | None,
+        issue_count: int,
+    ) -> dict[str, Any]:
+        """Commit and push changes, then attempt PR creation via MCP tool."""
+
+        summary: dict[str, Any] = {}
+
+        def _run(cmd: list[str]) -> dict[str, Any]:
+            result = subprocess.run(cmd, cwd=repo_path, capture_output=True, text=True)
+            return {
+                "cmd": cmd,
+                "code": result.returncode,
+                "stdout": result.stdout.strip(),
+                "stderr": result.stderr.strip(),
+            }
+
+        checkout = _run(["git", "checkout", "-B", branch])
+        add_res = _run(["git", "add", "-A"])
+        commit_res = _run(["git", "commit", "-m", f"Fix {issue_count} SonarQube issue(s)"])
+        push_res = _run(["git", "push", "-u", "origin", branch])
+
+        summary.update(
+            {
+                "checkout": checkout,
+                "add": add_res,
+                "commit": commit_res,
+                "push": push_res,
+            }
+        )
+
+        pr_tool = self._find_tool("create_pull_request")
+        if pr_tool and repository_url:
+            pr_args = {
+                "repository": repository_url,
+                "title": f"Fix SonarQube issues ({branch})",
+                "body": "Automated remediation using Poolside CLI and SonarQube guidance.",
+                "head": branch,
+                "base": "main",
+            }
+            try:
+                pr_result = pr_tool.invoke(pr_args)
+                summary["pull_request"] = pr_result
+            except Exception as exc:  # pragma: no cover - defensive
+                summary["pull_request_error"] = str(exc)
+
+        return summary
+
+    def _ensure_poolside_credentials(self) -> str | None:
+        """Write credentials.json from POOLSIDE_API_URL/POOLSIDE_TOKEN when missing."""
+
+        api_url = os.environ.get("POOLSIDE_API_URL")
+        token = os.environ.get("POOLSIDE_TOKEN")
+        if not api_url or not token:
+            return None
+
+        base_dir = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+        cred_path = base_dir / "poolside" / "credentials.json"
+        if cred_path.exists():
+            return str(cred_path)
+
+        cred_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = [{"type": "api-key", "apiUrl": api_url, "token": token}]
+        cred_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        print(f"Wrote Poolside credentials to {cred_path}")
+        return str(cred_path)
+
+    def _build_poolside_cli_tool(self) -> BaseTool | None:
+        """Create a Poolside CLI wrapper when the binary is available."""
+
+        default_cwd = os.environ.get("POOLSIDE_CWD")
+
+        # Prefer an explicit command, otherwise probe common poolside binaries.
+        explicit_cmd = os.environ.get("POOLSIDE_CLI_CMD")
+        candidate_commands = [explicit_cmd] if explicit_cmd else ["pool", "poolside"]
+        command = None
+        for candidate in candidate_commands:
+            if candidate and shutil.which(candidate):
+                command = candidate
+                break
+
+        if command is None:
+            print(
+                "Poolside CLI not found on PATH (set POOLSIDE_CLI_CMD or run task agent_langgraph:install-poolside); "
+                "skipping poolside_cli tool registration."
+            )
+            return None
+
+        creds_path = self._ensure_poolside_credentials()
+        if creds_path:
+            print(f"Poolside credentials resolved at {creds_path}")
+
+        env_overrides = {
+            key: value
+            for key, value in os.environ.items()
+            if key.startswith("POOLSIDE_")
+        }
+        if env_overrides:
+            print(
+                "Passing Poolside-specific environment variables to the CLI: "
+                f"{sorted(env_overrides.keys())}"
+            )
+
+        return PoolsideCLITool(
+            command=command, default_cwd=default_cwd, env_overrides=env_overrides
+        )
+
     def _load_mcp_tools(self) -> list[BaseTool]:
         try:
             print(f"Loading MCP tools with client: {self._mcp_client}")
@@ -405,6 +721,11 @@ class MyAgent(LangGraphAgent):
             print(f"Found {len(github_tools)} GitHub-related tools")
             print(f"Found {len(clone_tools)} clone-related tools")
             print(f"All tool names: {all_tool_names}")
+            poolside_tool = self._build_poolside_cli_tool()
+            if poolside_tool:
+                tools.append(poolside_tool)
+                print("Registered local Poolside CLI tool")
+
             return tools
         except FileNotFoundError as exc:
             msg = (
@@ -425,10 +746,15 @@ class MyAgent(LangGraphAgent):
             "repo_edit": [],
             "git_commit": [],
             "git_pr": [],
+            "inline_edit": [],
         }
 
         for tool in tools:
             name = getattr(tool, "name", "").lower()
+            if "poolside" in name:
+                capabilities["inline_edit"].append(tool.name)
+                capabilities["repo_edit"].append(tool.name)
+                continue
             if "sonar" in name:
                 capabilities["sonarqube"].append(tool.name)
             if any(key in name for key in ["write", "file", "patch", "apply"]):
@@ -535,15 +861,16 @@ class MyAgent(LangGraphAgent):
             + approval_guidance
             + "\n"
             + "Workflow guidance:\n"
-            "1) Immediately fetch SonarQube issues for the cloned repo: if the project key is unknown, call"
-            " search_my_sonarqube_projects to find a key matching the repository name or the repo_path; then call"
-            " search_sonar_issues_in_projects with that key and summarize results before applying fixes.\n"
-            "2) Prefer the GitHub MCP clone tool output path and derived working branch for changes.\n"
-            "3) Use SonarQube MCP tools (see available tool names in the latest system message) to fetch code smells, suggest remediation, and re-check after changes.\n"
-            "4) When auto-approval is enabled, apply repository changes directly after announcing the intent; otherwise ask for user approval.\n"
-            "5) After fixes, use GitHub MCP tools to commit changes on the suggested working branch and open a pull request.\n"
-            "6) Keep the user informed after each tool run with concise summaries, including what changed and any remaining issues.\n"
-            "7) Keep conversations focused on SonarQube remediation and PR creation."
+            "1) Determine the repository name from the git URL or repo_path and construct the SonarQube project key as CloudIQ:<REPOSITORY_NAME> (example: CloudIQ:psiz-acp-advisor-plugin). Do NOT call search_my_sonarqube_projects.\n"
+            "2) Treat the checkout path as the working directory; index the repository with poolside_cli (working_dir = repo root) before applying fixes so Poolside has context.\n"
+            "3) Immediately fetch SonarQube issues using search_sonar_issues_in_projects with that computed project key and summarize results before applying fixes.\n"
+            "4) For each Sonar issue, build a JSON tool call for poolside_cli from the repo root that references the issue details (rule, message, component path, startLine/endLine) and asks Poolside to generate and apply the patch.\n"
+            "5) Re-run search_sonar_issues_in_projects to verify remediation until no issues remain or retries are exhausted.\n"
+            "6) Prefer the GitHub MCP clone tool output path and derived working branch for changes.\n"
+            "7) When auto-approval is enabled, apply repository changes directly after announcing the intent; otherwise ask for user approval.\n"
+            "8) After fixes, use GitHub MCP tools to commit changes on the suggested working branch and open at most one pull request per end-to-end execution. If a PR was already attempted (see context), do not open another.\n"
+            "9) Always respond with JSON structures formatted for MCP tool execution when proposing tool calls, and keep the user informed after each tool run with concise summaries.\n"
+            "10) Keep conversations focused on SonarQube remediation and PR creation."
         )
 
     def _tools_with_approval_instructions(self) -> list[BaseTool]:
