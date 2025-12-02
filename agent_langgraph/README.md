@@ -31,7 +31,8 @@ needed.
   `--require_approval` to revert to interactive confirmation.
 - **Project key rule**: the SonarQube project key is always computed as `CloudIQ:<REPO_NAME>`; the agent does **not**
   call project-discovery tools.
-- **Issue retrieval**: uses the SonarQube MCP tool `search_sonar_issues_in_projects` with the computed key.
+- **Issue retrieval**: uses the SonarQube MCP tool `search_sonar_issues_in_projects` with the computed key and
+  requests only `BLOCKER` severities.
 - **Fixes**: when auto-approval is on, `sonarqube_autorun` immediately fetches issues, calls `poolside_cli` for each
   issue, and then runs git commit/push + a single PR creation attempt; the orchestrator also prefers Poolside for
   inline edits when available.
@@ -46,7 +47,7 @@ flowchart TD
     B --> C[Load MCP servers & derive repo name]
     C --> D[checkout_node clones repository]
     D --> E[Poolside retarget + context indexing]
-    E --> F[sonarqube_autorun derives CloudIQ key, fetches issues, applies Poolside patches]
+    E --> F[sonarqube_autorun derives CloudIQ key, fetches BLOCKER issues, applies Poolside patches]
     F --> G[Commit + Push + one-time PR automation]
     G --> H[sonarqube_orchestrator (fallback/interactive fixes, no extra PRs)]
 ```
@@ -55,10 +56,11 @@ flowchart TD
 
 If you have the Poolside inline coding assistant installed locally, the agent can call it directly as a LangGraph
 tool to apply SonarQube fixes with full-repo context. Set `POOLSIDE_CLI_CMD` if the binary is not on `PATH`
-(defaults to `pool`, falling back to `poolside`) and optionally `POOLSIDE_CWD` to force a working directory. Any
-environment variables that start with `POOLSIDE_` (for example `POOLSIDE_HOST`, `POOLSIDE_TOKEN`, `POOLSIDE_API_URL`,
-or a custom `POOLSIDE_CLI_CMD`) are passed through to the subprocess so your locally configured Poolside instance is
-used. When both `POOLSIDE_API_URL` and `POOLSIDE_TOKEN` are set, the agent will write a `~/.config/poolside/credentials.json`
+(defaults to `pool`, falling back to `poolside`). The checkout step always overwrites `POOLSIDE_CWD` to the cloned
+repository root so the Poolside helper cannot index or edit the automation repo itself. Any environment variables that
+start with `POOLSIDE_` (for example `POOLSIDE_HOST`, `POOLSIDE_TOKEN`, `POOLSIDE_API_URL`, or a custom
+`POOLSIDE_CLI_CMD`) are passed through to the subprocess so your locally configured Poolside instance is used. When
+both `POOLSIDE_API_URL` and `POOLSIDE_TOKEN` are set, the agent will write a `~/.config/poolside/credentials.json`
 entry automatically if one is not present.
 
 When the binary is detected, an extra tool named `poolside_cli` is registered and exposed to the orchestrator; it
@@ -82,9 +84,10 @@ and `task agent_langgraph:cli` so every CLI invocation boots Poolside automatica
 
 ### How the checkout is indexed with Poolside
 
-After the repository is cloned, the checkout node retargets the Poolside tool to the repo root and—when
-auto-approval is on—runs a one-time indexing prompt to give Poolside full context. This happens before any SonarQube
-issues are processed and uses the repo root as `working_dir` so subsequent fixes operate on the cloned files:
+After the repository is cloned, the checkout node retargets the Poolside tool to the repo root (overwriting
+`POOLSIDE_CWD` to that path) and—when auto-approval is on—runs a one-time indexing prompt to give Poolside full
+context. This happens before any SonarQube issues are processed and uses the resolved repo root as `working_dir` so
+subsequent fixes operate only on the cloned files in `agent_langgraph/custom_model/workspace`:
 
 ```python
 # agent_langgraph/custom_model/agent.py (checkout_node)
@@ -97,22 +100,28 @@ def _index_repo_with_poolside(self, repo_path: str) -> None:
     tool = next((t for t in self._mcp_tools if isinstance(t, PoolsideCLITool)), None)
     if not tool:
         return
+    repo_root = str(Path(repo_path).resolve())
     args = ["--unsafe-auto-allow", "-p", "Index this repository for context before applying SonarQube fixes", "--", "."]
-    tool.invoke({"args": args, "working_dir": repo_path})
+    tool.invoke({"args": args, "working_dir": repo_root})
 ```
 
-With this flow, the Poolside agent indexes the freshly cloned repository in `agent_langgraph/custom_model/workspace` and
-has full-file context when applying patches generated from SonarQube issue details.
+With this flow, the Poolside agent indexes only the freshly cloned repository in
+`agent_langgraph/custom_model/workspace` and has full-file context when applying patches generated from SonarQube issue
+details—never the automation code in this repo.
 
 ### How SonarQube issues are auto-applied (auto-approval path)
 
-When auto-approval is enabled, the `sonarqube_autorun` node applies the issues returned by
+When auto-approval is enabled, the `sonarqube_autorun` node applies the `BLOCKER` issues returned by
 `search_sonar_issues_in_projects` before the orchestrator runs. Each issue is translated into a `poolside_cli` call with
 the relative file path and line range, then the agent performs git commit, push, and a single PR creation attempt (when
 the GitHub MCP tool is available):
 
 ```python
-issues = self._extract_sonar_issues(issues_result)
+issues = [
+    issue
+    for issue in self._extract_sonar_issues(issues_result)
+    if str(issue.get("severity", "")).upper() == "BLOCKER"
+]
 poolside_applied = self._apply_sonar_issues_with_poolside(repo_path, issues)
 commit_status = self._git_commit_push_pr(
     repo_path=repo_path,

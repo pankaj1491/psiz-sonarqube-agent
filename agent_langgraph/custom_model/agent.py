@@ -51,8 +51,8 @@ class PoolsideCLIArgs(BaseModel):
 class PoolsideCLITool(BaseTool):
     """Lightweight wrapper for a locally installed Poolside CLI."""
 
-    name = "poolside_cli"
-    description = (
+    name: str = "poolside_cli"
+    description: str = (
         "Run the Poolside CLI for repo-aware code edits. Provide the exact argument list you would "
         "pass to the `poolside` binary; working_dir should be the repository root when applying patches."
     )
@@ -68,6 +68,12 @@ class PoolsideCLITool(BaseTool):
         """Update the default working directory after checkout."""
 
         self._default_cwd = cwd
+        # Always constrain Poolside to the checked-out repository so it doesn't index
+        # or edit files from this automation repo. We also update POOLSIDE_CWD in both
+        # the live environment and the tool's env overrides to keep subprocess calls
+        # aligned with the latest checkout path.
+        self._env_overrides["POOLSIDE_CWD"] = cwd
+        os.environ["POOLSIDE_CWD"] = cwd
 
     def _run(
         self, args: list[str], working_dir: str | None = None, **_: Any
@@ -306,7 +312,9 @@ class MyAgent(LangGraphAgent):
             return Command(update={"messages": messages})
 
         project_key = f"CloudIQ:{repo_name}"
-        issues_result = issues_tool.invoke({"projects": project_key})
+        issues_result = issues_tool.invoke(
+            {"projects": project_key, "severities": "BLOCKER"}
+        )
         messages.append(
             SystemMessage(
                 content=(
@@ -319,7 +327,11 @@ class MyAgent(LangGraphAgent):
         repo_path = cast(str | None, state.get("repo_path"))
         working_branch = cast(str | None, state.get("working_branch"))
         repository_url = cast(str | None, state.get("repository_url"))
-        issues = self._extract_sonar_issues(issues_result)
+        issues = [
+            issue
+            for issue in self._extract_sonar_issues(issues_result)
+            if str(issue.get("severity", "")).upper() == "BLOCKER"
+        ]
 
         pr_created = False
 
@@ -507,7 +519,7 @@ class MyAgent(LangGraphAgent):
             return
 
         tool.retarget_working_dir(repo_path)
-        os.environ.setdefault("POOLSIDE_CWD", repo_path)
+        os.environ["POOLSIDE_CWD"] = repo_path
         print(f"Poolside CLI working directory set to {repo_path}")
 
     def _index_repo_with_poolside(self, repo_path: str) -> None:
@@ -518,6 +530,8 @@ class MyAgent(LangGraphAgent):
         if not tool:
             return
 
+        repo_root = str(Path(repo_path).resolve())
+
         args = [
             "--unsafe-auto-allow",
             "-p",
@@ -525,7 +539,7 @@ class MyAgent(LangGraphAgent):
             "--",
             ".",
         ]
-        result = tool.invoke({"args": args, "working_dir": repo_path})
+        result = tool.invoke({"args": args, "working_dir": repo_root})
         print(
             "Poolside indexing run",
             json.dumps(
@@ -562,6 +576,8 @@ class MyAgent(LangGraphAgent):
         if not tool:
             return []
 
+        repo_root = str(Path(repo_path).resolve())
+
         applied: list[dict[str, Any]] = []
         for issue in issues:
             component = issue.get("component", "")
@@ -578,7 +594,7 @@ class MyAgent(LangGraphAgent):
                 "Use the repository context to fix the violation and ensure the file remains valid."
             )
             args = ["--unsafe-auto-allow", "-p", prompt, "--", relative_path]
-            result = tool.invoke({"args": args, "working_dir": repo_path})
+            result = tool.invoke({"args": args, "working_dir": repo_root})
             applied.append(
                 {
                     "issue_key": issue.get("key"),
@@ -863,7 +879,7 @@ class MyAgent(LangGraphAgent):
             + "Workflow guidance:\n"
             "1) Determine the repository name from the git URL or repo_path and construct the SonarQube project key as CloudIQ:<REPOSITORY_NAME> (example: CloudIQ:psiz-acp-advisor-plugin). Do NOT call search_my_sonarqube_projects.\n"
             "2) Treat the checkout path as the working directory; index the repository with poolside_cli (working_dir = repo root) before applying fixes so Poolside has context.\n"
-            "3) Immediately fetch SonarQube issues using search_sonar_issues_in_projects with that computed project key and summarize results before applying fixes.\n"
+            "3) Immediately fetch SonarQube issues using search_sonar_issues_in_projects with that computed project key, limiting to severities=BLOCKER, and summarize results before applying fixes.\n"
             "4) For each Sonar issue, build a JSON tool call for poolside_cli from the repo root that references the issue details (rule, message, component path, startLine/endLine) and asks Poolside to generate and apply the patch.\n"
             "5) Re-run search_sonar_issues_in_projects to verify remediation until no issues remain or retries are exhausted.\n"
             "6) Prefer the GitHub MCP clone tool output path and derived working branch for changes.\n"
