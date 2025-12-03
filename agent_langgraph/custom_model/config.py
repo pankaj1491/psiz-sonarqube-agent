@@ -38,6 +38,7 @@ class Config(DataRobotAppFrameworkBaseSettings):
     mcp_deployment_id: str | None = None
     external_mcp_url: str | None = None
     auto_approve_tools: bool = True
+    verbose_logging: bool = False
 
     agent_endpoint: str = Field(
         default="http://localhost:8842", validation_alias="AGENT_LANGGRAPH_ENDPOINT"
