@@ -358,7 +358,7 @@ class MyAgent(LangGraphAgent):
         issues = [
             i for i in raw_issues
             if i.get("severity", "").upper() in {"MAJOR", "CRITICAL"}
-        ]
+        ][:1]
 
         print(
             f"SonarQube autorun: {len(issues_result)} issue(s) returned, "
@@ -410,6 +410,12 @@ class MyAgent(LangGraphAgent):
                 "pending_fix_work": True
             }
         )
+
+    # Normalize repository for MCP PR tool
+    def _normalize_repo(url: str) -> str:
+        # Extract last 2 segments: org/repo
+        parts = url.replace(".git", "").split("/")
+        return f"{parts[-2]}/{parts[-1]}"
 
     def post_model_hook(self, state: AgentState):
         """
@@ -733,6 +739,7 @@ class MyAgent(LangGraphAgent):
     ) -> dict[str, Any]:
         """Commit and push changes only if diffs exist, then create PR."""
         summary: dict[str, Any] = {}
+
         def _run(cmd: list[str]) -> dict[str, Any]:
             result = subprocess.run(cmd, cwd=repo_path, capture_output=True, text=True)
             return {
@@ -741,40 +748,89 @@ class MyAgent(LangGraphAgent):
                 "stdout": result.stdout.strip(),
                 "stderr": result.stderr.strip(),
             }
-        # Check if there are any changes first
+
+        def _parse_owner_repo(url: str) -> tuple[str, str]:
+            """
+            Parse Git owner/repo from a URL like:
+            https://eos2git.cec.lab.emc.com/CloudIQ/psiz-acp-advisor-plugin.git
+            -> ("CloudIQ", "psiz-acp-advisor-plugin")
+            """
+            cleaned = url.rstrip("/")
+            if cleaned.endswith(".git"):
+                cleaned = cleaned[:-4]
+
+            parts = cleaned.split("/")
+            if len(parts) < 2:
+                raise ValueError(f"Cannot parse owner/repo from URL: {url}")
+
+            owner = parts[-2]
+            repo = parts[-1]
+            return owner, repo
+
+        # 1️⃣ Check if there are any changes first
         changes_check = _run(["git", "status", "--porcelain"])
         summary["pre_check"] = changes_check
+
         if not changes_check["stdout"]:
-            summary["skipped"] = "No file changes detected — skipping commit, push, and PR creation."
+            summary["skipped"] = (
+                "No file changes detected — skipping commit, push, and PR creation."
+            )
             return summary
-        # Continue with normal Git flow
+
+        # 2️⃣ Normal Git flow
         checkout = _run(["git", "checkout", "-B", branch])
         add_res = _run(["git", "add", "-A"])
-        commit_res = _run(["git", "commit", "-m", f"Fix {issue_count} SonarQube issue(s)"])
+        commit_res = _run(
+            ["git", "commit", "-m", f"Fix {issue_count} SonarQube issue(s)"]
+        )
         push_res = _run(["git", "push", "-u", "origin", branch])
-        summary.update({
-            "checkout": checkout,
-            "add": add_res,
-            "commit": commit_res,
-            "push": push_res,
-        })
-        # Create PR only if commit succeeded
+
+        summary.update(
+            {
+                "checkout": checkout,
+                "add": add_res,
+                "commit": commit_res,
+                "push": push_res,
+            }
+        )
+
+        # 3️⃣ Create PR only if commit succeeded and we have a repo URL
         if commit_res["code"] == 0 and repository_url:
+            try:
+                owner, repo = _parse_owner_repo(repository_url)
+            except ValueError as exc:
+                summary["pull_request_error"] = f"Owner/repo parse error: {exc}"
+                return summary
+
             pr_tool = self._find_tool("create_pull_request")
+            print(f"🔍 PR Tool Detection → {getattr(pr_tool, 'name', 'None')}")
+            print(f"📌 Target repo → {owner}/{repo}")
+
             if pr_tool:
                 pr_args = {
-                    "repository": repository_url,
+                    "owner": owner,                      # e.g. "CloudIQ"
+                    "repo": repo,                        # e.g. "psiz-acp-advisor-plugin"
                     "title": f"Fix SonarQube issues ({branch})",
                     "body": "Automated remediation using Poolside CLI and SonarQube guidance.",
-                    "head": branch,
-                    "base": "main",
+                    "head": branch,                      # source branch (already pushed)
+                    "base": "main",                      # target branch
+                    "draft": True,
+                    "maintainer_can_modify": True,
                 }
+
                 try:
-                    pr_result = pr_tool.invoke(pr_args)
+                    print(f"🚀 Creating Pull Request with args: owner={owner}, repo={repo}, head={branch}, base=main")
+                    pr_result = self._invoke_tool_sync(pr_tool, pr_args)
                     summary["pull_request"] = pr_result
+                    print("🎉 Pull Request created!")
                 except Exception as exc:
                     summary["pull_request_error"] = str(exc)
+                    print(f"❌ PR creation failed: {exc}")
+            else:
+                print("⚠ No PR tool found — skipping PR creation.")
+
         return summary
+
 
     def _build_poolside_cli_tool(self) -> BaseTool | None:
         """Register Poolside CLI tool if installed system-wide."""
@@ -946,7 +1002,7 @@ class MyAgent(LangGraphAgent):
             checkout_summary = SystemMessage(
                 content=(
                     f"Repository cloned to {repo_path}. "
-                    f"Use branch '{working_branch or 'auto/<repo>'}' for commits and PRs."
+                    f"Use branch '{'SESW02J-1809'}' for commits and PRs."
                 )
             )
         messages = result["messages"]
