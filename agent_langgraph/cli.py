@@ -124,6 +124,16 @@ def cli(
 @pass_environment
 @click.option("--user_prompt", default="", help="Input to use for chat.")
 @click.option("--completion_json", default="", help="Path to json to use for chat.")
+@click.option(
+    "--repository_url",
+    default="",
+    help="Repository URL to clone (fallback to REPOSITORY_URL env var).",
+)
+@click.option(
+    "--working_branch",
+    default="",
+    help="Branch name to use for commits/PRs (fallback to GIT_BRANCH_NEW env var).",
+)
 @click.option("--stream", is_flag=True, help="Enable streaming response.")
 @click.option(
     "--show_output", is_flag=True, help="Show the full stored execution result."
@@ -140,6 +150,8 @@ def execute(
     environment: Any,
     user_prompt: str,
     completion_json: str,
+    repository_url: str,
+    working_branch: str,
     show_output: bool,
     stream: bool,
     auto_approve: bool,
@@ -165,6 +177,12 @@ def execute(
     """
     if len(user_prompt) == 0 and len(completion_json) == 0:
         raise click.UsageError("User prompt message or completion json must provided.")
+
+    # Allow explicit CLI overrides to flow into the agent state via env vars
+    if repository_url:
+        os.environ["REPOSITORY_URL"] = repository_url
+    if working_branch:
+        os.environ["GIT_BRANCH_NEW"] = working_branch
 
     click.echo("Running agent...")
     response = environment.interface.local(

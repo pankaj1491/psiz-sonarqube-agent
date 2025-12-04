@@ -8,6 +8,13 @@ The repository still follows the DataRobot agent template conventions; see the
 [DataRobot Agent Templates](https://github.com/datarobot-community/datarobot-agent-templates) reference for the
 underlying deployment model.
 
+## Architecture and local setup
+
+- See [ARCHITECTURE.md](./ARCHITECTURE.md) for a deep dive into the LangGraph nodes, MCP client/server interplay,
+  Poolside integration, and the execution-state handoffs that power automated SonarQube remediation.
+- The same document also walks through local environment setup (dependencies, MCP server config, optional Poolside
+  enablement, and CLI invocation) so you can run the workflow end-to-end.
+
 ## MCP configuration
 
 LangGraph agents now read MCP server definitions from `agent_langgraph/custom_model/mcp_servers.json`
@@ -38,6 +45,32 @@ needed.
   inline edits when available.
 - **Git/PR**: commits land on the derived working branch (for example `auto/psiz-acp-advisor-plugin`) followed by one
   pull request via GitHub MCP helpers; subsequent nodes are instructed not to open additional PRs in the same run.
+
+### Pinning the checkout repo and branch
+
+You can override the repository URL and the branch name from `.env` or CLI flags without changing the agent code:
+
+```
+GIT_BRANCH_NEW="NEW-BRANCH" \
+REPOSITORY_URL="https://eos2git.cec.lab.emc.com/CloudIQ/psiz-acp-advisor-plugin.git" \
+task agent:cli START_DEV=1 -- execute \
+  --user_prompt "Fix SonarQube issues and prepare a PR" \
+  --auto_approve \
+  --show_output
+```
+
+Alternatively, pass the values directly to the CLI (they will be propagated into the agent state via environment
+variables):
+
+```
+task agent:cli START_DEV=1 -- execute \
+  --user_prompt "Fix SonarQube issues and prepare a PR" \
+  --repository_url "https://eos2git.cec.lab.emc.com/CloudIQ/psiz-acp-advisor-plugin.git" \
+  --working_branch "NEW-BRANCH"
+```
+
+Checkout honors explicit overrides first: a `working_branch` value passed via CLI (or injected into the agent state)
+beats `GIT_BRANCH_NEW`, and only when neither is provided will the branch be derived as `auto/<issue-id-or-repo-name>`.
 
 Mermaid view of the flow:
 
