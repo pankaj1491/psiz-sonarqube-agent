@@ -20,6 +20,8 @@ from unittest.mock import ANY, AsyncMock, MagicMock, Mock, patch
 
 import pytest
 
+from custom_model.agent import MyAgent
+
 
 class TestCustomModel:
     def test_load_model(self):
@@ -168,3 +170,29 @@ class TestCustomModel:
         mock_agent_instance.invoke.assert_called_once_with(
             completion_create_params=completion_create_params
         )
+
+    def test_derive_working_branch_prefers_explicit_state(self, monkeypatch):
+        agent = MyAgent.__new__(MyAgent)
+
+        state = {"working_branch": "feature/explicit"}
+        branch = agent._derive_working_branch(state, "/tmp/repo")
+
+        assert branch == "feature/explicit"
+
+    def test_derive_working_branch_prefers_env_override(self, monkeypatch):
+        agent = MyAgent.__new__(MyAgent)
+        monkeypatch.setenv("GIT_BRANCH_NEW", "env-branch")
+
+        state: dict[str, str] = {}
+        branch = agent._derive_working_branch(state, "/tmp/repo")
+
+        assert branch == "env-branch"
+
+    def test_derive_working_branch_falls_back_to_issue_slug(self, monkeypatch):
+        agent = MyAgent.__new__(MyAgent)
+        monkeypatch.delenv("GIT_BRANCH_NEW", raising=False)
+
+        state = {"issue_id": "ABC 123"}
+        branch = agent._derive_working_branch(state, "/tmp/repo")
+
+        assert branch == "auto/abc-123"

@@ -163,7 +163,7 @@ class MyAgent(LangGraphAgent):
         """Normalize the incoming state before invoking MCP tools."""
         state.setdefault("repo_path", None)
         state.setdefault("repository_url", None)
-        state.setdefault("working_branch", None)
+        state.setdefault("working_branch", os.environ.get("GIT_BRANCH_NEW"))
         state.setdefault("messages", [])
         state.setdefault("available_tools", self._tool_capabilities)
         return state
@@ -595,6 +595,11 @@ class MyAgent(LangGraphAgent):
                 raise RuntimeError("The GitHub MCP tool cannot be invoked.")
         return str(target_dir.resolve())
     def _derive_working_branch(self, state: AgentState, repo_path: str) -> str:
+        # Respect explicit overrides first
+        branch_override = state.get("working_branch") or os.environ.get("GIT_BRANCH_NEW")
+        if branch_override:
+            return cast(str, branch_override)
+
         issue_identifier = state.get("issue_id") or state.get("issue_key")
         if issue_identifier:
             slug = str(issue_identifier).replace(" ", "-").lower()
